@@ -1,22 +1,3 @@
-"""
-IndusInd Bank Statement Extractor
-====================================
-Handles IndusInd Bank "Account Statement" format.
-Aligned with HDFC/ICICI: returns AccountInfo and transactions.
-
-Statement layout:
-  - Header: Customer Name, Account No, From Date, To Date
-  - Table columns:
-      Bank Reference | Value Date | Transaction Date & Time | Type |
-      Payment Narration | Debit | Credit | Available Balance
-
-Notes:
-  - Type column: "Debit" or "Credit" string
-  - Balance can be negative (shown as -12,34,567.89)
-  - Transaction Date includes time (e.g. '01-APR-25 06:59:44')
-  - Value Date format: '01 Apr 2025'
-"""
-
 import re
 import pdfplumber
 import pandas as pd
@@ -81,7 +62,7 @@ class AccountInfo:
 # IndusInd transaction columns (matches PDF table, aligned with ICICI)
 INDUSIND_TXN_COLUMNS = [
     "row_id", "sno", "tran_id", "transaction_date", "value_date", "posted_time",
-    "narration", "debit", "credit", "balance", "txn_type", "reference",
+    "narration", "debit", "credit", "balance", "txn_type", "reference", "balance_ok",
 ]
 
 
@@ -89,7 +70,7 @@ def _correct_utr_as_amount(df: pd.DataFrame) -> pd.DataFrame:
     """Fix rows where UTR/reference (e.g. 12-digit) was parsed as amount, or balance from wrong column."""
     if df.empty or 'balance' not in df.columns or 'debit' not in df.columns or 'credit' not in df.columns:
         return df
-    UTR_THRESHOLD = 1e8  # amounts > 10 crore likely UTR/reference
+    UTR_THRESHOLD = 1e8   # amounts > 10 crore likely UTR/reference
     BAL_IMPLAUSIBLE = 1e4  # |balance| < 10k when |prev| > 100k suggests wrong-cell extraction
     prev_bal = None
     for i in range(len(df)):
@@ -105,10 +86,9 @@ def _correct_utr_as_amount(df: pd.DataFrame) -> pd.DataFrame:
         dr = 0.0 if (_dr is None or (isinstance(_dr, float) and pd.isna(_dr))) else float(_dr)
         cr = 0.0 if (_cr is None or (isinstance(_cr, float) and pd.isna(_cr))) else float(_cr)
         if prev_bal is not None:
-            expected_delta = prev_bal - bal  # debit - credit
+            expected_delta = prev_bal - bal
             actual_delta = dr - cr
             computed_bal = prev_bal - dr + cr
-            # Fix implausible balance (e.g. 17 when prev was -112M) — wrong cell parsed as balance
             if abs(prev_bal) > 1e5 and abs(bal) < BAL_IMPLAUSIBLE and abs(computed_bal) > BAL_IMPLAUSIBLE:
                 df.at[df.index[i], 'balance'] = computed_bal
                 bal = computed_bal
@@ -121,6 +101,30 @@ def _correct_utr_as_amount(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _clean_narration(raw: str) -> str:
+    """
+    Reconstruct a narration string that was split across PDF rendering lines.
+
+    Rules applied per character pair surrounding each '\n':
+      1. char_before is ' '          → drop \n, space already present
+      2. char_before or char_after is '/' → drop \n, path/segment continuation
+      3. both chars are alphanumeric  → drop \n, mid-word PDF wrap
+      4. otherwise                    → replace \n with ' ', real word boundary
+    """
+    def _join(m: re.Match) -> str:
+        before, after = m.group(1), m.group(2)
+        if before == ' ':
+            return before
+        if before == '/' or after == '/':
+            return before + after
+        if before.isalnum() and after.isalnum():
+            return before + after
+        return before + ' ' + after
+
+    result = re.sub(r'(.)\n(.)', _join, raw)
+    return re.sub(r' {2,}', ' ', result).strip()
+
+
 def _normalize_df_with_rowid(df: pd.DataFrame) -> pd.DataFrame:
     """Add row_id and ensure standard columns (incl. tran_id, posted_time from PDF)."""
     for col in INDUSIND_TXN_COLUMNS:
@@ -131,23 +135,68 @@ def _normalize_df_with_rowid(df: pd.DataFrame) -> pd.DataFrame:
     return df[INDUSIND_TXN_COLUMNS].reset_index(drop=True)
 
 
+def _add_balance_ok(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add a 'balance_ok' boolean column.
+    True  = this row's balance is consistent with previous row (within ₹0.02).
+    False = balance break (legitimate page-boundary gap or deleted pages).
+    The first row is always True.
+    """
+    ok = [True]
+    for i in range(1, len(df)):
+        prev_bal = df.iloc[i - 1].get('balance')
+        curr_bal = df.iloc[i].get('balance')
+        dr = df.iloc[i].get('debit')
+        cr = df.iloc[i].get('credit')
+        if (prev_bal is None or (isinstance(prev_bal, float) and pd.isna(prev_bal))
+                or curr_bal is None or (isinstance(curr_bal, float) and pd.isna(curr_bal))):
+            ok.append(True)
+            continue
+        dr = 0.0 if (dr is None or (isinstance(dr, float) and pd.isna(dr))) else float(dr)
+        cr = 0.0 if (cr is None or (isinstance(cr, float) and pd.isna(cr))) else float(cr)
+        computed = round(float(prev_bal) - dr + cr, 2)
+        ok.append(abs(computed - round(float(curr_bal), 2)) <= 0.02)
+    df = df.copy()
+    df['balance_ok'] = ok
+    return df
+
+
 class IndusIndBankExtractor(BaseBankExtractor):
 
     BANK_NAME = "IndusInd Bank"
     CONFIG = INDUSIND_CONFIG
+
+    # ── COL_MAP ─────────────────────────────────────────────────
+    # Maps normalised header cell text → internal field name.
+    # Both no-space and spaced variants of "Transaction Date & Time" are mapped.
+    # Additional aliases for robustness against minor PDF text variations.
+    COL_MAP = {
+        'bank reference': 'reference',
+        'value date': 'value_date',
+        'transaction date& time': 'transaction_date',    # no-space variant
+        'transaction date & time': 'transaction_date',   # spaced variant (actual PDF)
+        'transaction date': 'transaction_date',
+        'type': 'txn_type',
+        'payment narration': 'narration',
+        'narration': 'narration',
+        'debit': 'debit',
+        'credit': 'credit',
+        'available balance': 'balance',
+        'balance': 'balance',
+    }
 
     # ── detection ───────────────────────────────────────────────
 
     def detect(self, first_page_text: str) -> bool:
         indicators = [
             r'IndusInd\s*Bank',
-            r'INDB\d{7}',            # IndusInd IFSC prefix
+            r'INDB\d{7}',
             r'indusind\.com',
             r'Account\s+Statement',
         ]
         return any(re.search(p, first_page_text, re.I) for p in indicators)
 
-    # ── main extraction (HDFC-style return) ──────────────────────
+    # ── main extraction ──────────────────────────────────────────
 
     def extract(self, pdf_path: str, raw_text: str = None) -> Dict[str, Any]:
         if raw_text is None:
@@ -205,7 +254,7 @@ class IndusIndBankExtractor(BaseBankExtractor):
         result["currency"] = "INR"
         return result
 
-    # ── account info (HDFC-style parsing) ────────────────────────
+    # ── account info ─────────────────────────────────────────────
 
     def _parse_account_info(self, text: str) -> AccountInfo:
         info = AccountInfo(bank_name=self.BANK_NAME)
@@ -214,7 +263,10 @@ class IndusIndBankExtractor(BaseBankExtractor):
         if m:
             info.account_number = m.group(1).strip()
 
-        m = re.search(r'(?:Customer\s+Name|Account\s+Name)\s*[:\-]?\s*(.+?)(?:\n|Account\s+No|\([A-Z\s]+\)|$)', text, re.I | re.DOTALL)
+        m = re.search(
+            r'(?:Customer\s+Name|Account\s+Name)\s*[:\-]?\s*(.+?)(?:\n|Account\s+No|\([A-Z\s]+\)|$)',
+            text, re.I | re.DOTALL
+        )
         if m:
             name = m.group(1).strip()
             name = re.sub(r'\([^)]*\)', '', name).strip()
@@ -249,40 +301,21 @@ class IndusIndBankExtractor(BaseBankExtractor):
 
     def _parse_account_number(self, text: str) -> str:
         m = re.search(r'Account\s+No\s*[:\-]?\s*(\d{10,18})', text, re.I)
-        if m:
-            return m.group(1).strip()
-        return ''
+        return m.group(1).strip() if m else ''
 
     def _parse_account_holder(self, text: str) -> str:
         m = re.search(r'Customer\s+Name\s*[:\-]?\s*(.+?)(?:\n|Account)', text, re.I)
-        if m:
-            return m.group(1).strip()
-        return ''
+        return m.group(1).strip() if m else ''
 
     def _parse_opening_balance(self, text: str) -> Optional[float]:
-        # IndusInd may not explicitly show opening balance
-        # Try to derive from first transaction's balance - first debit/credit
-        patterns = [
-            r'Opening\s+Bal(?:ance)?\s*[:\-]?\s*(-?[\d,]+\.?\d*)',
-        ]
-        for p in patterns:
-            m = re.search(p, text, re.I)
-            if m:
-                return clean_amount(m.group(1))
-        return None
+        m = re.search(r'Opening\s+Bal(?:ance)?\s*[:\-]?\s*(-?[\d,]+\.?\d*)', text, re.I)
+        return clean_amount(m.group(1)) if m else None
 
     def _parse_closing_balance(self, text: str) -> Optional[float]:
-        patterns = [
-            r'Closing\s+Bal(?:ance)?\s*[:\-]?\s*(-?[\d,]+\.?\d*)',
-        ]
-        for p in patterns:
-            m = re.search(p, text, re.I)
-            if m:
-                return clean_amount(m.group(1))
-        return None
+        m = re.search(r'Closing\s+Bal(?:ance)?\s*[:\-]?\s*(-?[\d,]+\.?\d*)', text, re.I)
+        return clean_amount(m.group(1)) if m else None
 
     def _parse_period(self, text: str):
-        # "From Date : 01-Apr-25    To Date : 31-May-25"
         patterns = [
             r'From\s+Date\s*[:\-]?\s*(\d{2}[-/]\w{3}[-/]\d{2,4})'
             r'.*?To\s+Date\s*[:\-]?\s*(\d{2}[-/]\w{3}[-/]\d{2,4})',
@@ -310,7 +343,7 @@ class IndusIndBankExtractor(BaseBankExtractor):
 
     def _extract_via_pdfplumber(self, pdf_path: str) -> Optional[pd.DataFrame]:
         all_rows = []
-        saved_col_indices = None  # reuse header from page 1 for continuation pages
+        saved_col_indices = None
 
         table_settings = {
             "vertical_strategy": "lines",
@@ -319,63 +352,90 @@ class IndusIndBankExtractor(BaseBankExtractor):
             "join_tolerance": 5,
         }
 
-        COL_MAP = {
-            'bank reference': 'reference',
-            'value date': 'value_date',
-            'transaction date& time': 'transaction_date',
-            'transaction date & time': 'transaction_date',
-            'transaction date': 'transaction_date',
-            'type': 'txn_type',
-            'payment narration': 'narration',
-            'narration': 'narration',
-            'debit': 'debit',
-            'credit': 'credit',
-            'available balance': 'balance',
-            'balance': 'balance',
-        }
-
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
                 tables = page.extract_tables(table_settings)
                 for table in tables:
-                    if not table or len(table) < 2:
+                    if not table:
                         continue
 
-                    header = [str(c or '').lower().strip().replace('\n', ' ')
-                              for c in table[0]]
+                    # ── FIX 8+9: Robust header detection ─────────────────────
+                    # Normalise BOTH real \n and escaped \\n so multi-line PDF
+                    # header cells ("Available\nBalance") are handled correctly.
+                    header_row_idx = None
+                    for row_idx, row in enumerate(table):
+                        normalised = [
+                            str(c or '').lower().strip()
+                                        .replace('\n', ' ')   # real newline
+                                        .replace('\\n', ' ')  # escaped newline
+                            for c in row
+                        ]
+                        if self._is_txn_header(normalised):
+                            header_row_idx = row_idx
+                            col_indices = {}
+                            for col_idx, h in enumerate(normalised):
+                                mapped = self.COL_MAP.get(h)
+                                if mapped and mapped not in col_indices:
+                                    col_indices[mapped] = col_idx
+                            # Fallback: no explicit txn_date → use value_date
+                            if ('transaction_date' not in col_indices
+                                    and 'value_date' in col_indices):
+                                col_indices['transaction_date'] = col_indices['value_date']
+                            if ('transaction_date' in col_indices
+                                    or 'value_date' in col_indices):
+                                saved_col_indices = col_indices
+                            break
 
-                    if self._is_txn_header(header):
-                        col_indices = {}
-                        for idx, h in enumerate(header):
-                            mapped = COL_MAP.get(h)
-                            if mapped and mapped not in col_indices:
-                                col_indices[mapped] = idx
-                        if 'transaction_date' not in col_indices and 'value_date' in col_indices:
-                            col_indices['transaction_date'] = col_indices['value_date']
-                        if 'transaction_date' in col_indices or 'value_date' in col_indices:
-                            saved_col_indices = col_indices
-
+                    # FIX 2: No column mapping yet → skip table entirely
                     if saved_col_indices is None:
                         continue
 
-                    start = 1 if self._is_txn_header(header) else 0
-                    for row in table[start:]:
-                        parsed = self._parse_row(row, saved_col_indices)
-                        if parsed:
-                            all_rows.append(parsed)
+                    data_start = (header_row_idx + 1) if header_row_idx is not None else 0
+
+                    # Diagnostic counters per table
+                    # parsed_count = 0
+                    # skipped_count = 0
+                    # for row in table[data_start:]:
+                    #     parsed = self._parse_row(row, saved_col_indices, page.page_number)
+                    #     if parsed:
+                    #         all_rows.append(parsed)
+                    #         parsed_count += 1
+                    #     else:
+                    #         skipped_count += 1
+
+                    # self._log(
+                    #     f"[Page {page.page_number}] Table rows: {len(table) - data_start} "
+                    #     f"| Parsed: {parsed_count} | Skipped: {skipped_count}"
+                    # )
 
         if not all_rows:
             return None
         return self._finalize_df(pd.DataFrame(all_rows))
 
+    # ── FIX 8: Flat-string header detection ─────────────────────
+
     def _is_txn_header(self, header: List[str]) -> bool:
-        has_date = any('date' in h for h in header)
-        has_ref = any('reference' in h or 'narration' in h for h in header)
-        has_amount = any(w in h for h in header
-                         for w in ['debit', 'credit', 'balance'])
+        """
+        FIX 8: Join ALL header cells into a single flat string before matching.
+        This handles cases where pdfplumber splits a multi-line header cell
+        across two rows — the individual cells may not match, but the flat
+        string will contain the keywords.
+        """
+        flat = ' '.join(header)
+        has_date   = 'date' in flat
+        has_ref    = 'reference' in flat or 'narration' in flat
+        has_amount = any(w in flat for w in ['debit', 'credit', 'balance'])
         return has_date and (has_ref or has_amount)
 
-    def _parse_row(self, row: list, col_indices: dict) -> Optional[Dict]:
+    # ── _parse_row ────────────────────────────────────────────────
+
+    def _parse_row(
+        self,
+        row: list,
+        col_indices: dict,
+        page_number: int = 0,
+    ) -> Optional[Dict]:
+
         def get(key):
             idx = col_indices.get(key)
             if idx is not None and idx < len(row):
@@ -383,20 +443,33 @@ class IndusIndBankExtractor(BaseBankExtractor):
                 return str(v).strip() if v is not None else ''
             return ''
 
-        txn_date_raw = get('transaction_date')
-        # IndusInd date in format: '01-APR-25 06:59:44' or '01 Apr 2025'
-        date_part = txn_date_raw.split(' ')[0] if txn_date_raw else ''
-        if not date_part or not re.match(r'\d{1,2}[-/\s]\w+[-/\s]\d{2,4}', date_part):
+        # ── FIX 3: Strip leading apostrophe from date cells ───────
+        txn_date_raw   = get('transaction_date').lstrip("'").strip()
+        value_date_raw = get('value_date').lstrip("'").strip()
+
+        # ── FIX 7: Fallback to value_date when txn_date is empty ─
+        # pdfplumber sometimes splits the "Transaction Date & Time" cell
+        # across two lines; in those cases txn_date_raw ends up empty or
+        # contains only a time string.  Use value_date as the canonical date.
+        active_date_raw = txn_date_raw if txn_date_raw else value_date_raw
+        date_part = active_date_raw.split(' ')[0] if active_date_raw else ''
+
+        if not date_part or not re.match(r'\d{1,2}[-/]\w+[-/]\d{2,4}', date_part):
+            self._log(
+                f"[Page {page_number}] Skipped row (no parseable date) "
+                f"txn_date_raw={txn_date_raw!r} value_date_raw={value_date_raw!r} "
+                f"row={row}"
+            )
             return None
 
-        debit_raw = get('debit')
-        credit_raw = get('credit')
+        debit_raw    = get('debit')
+        credit_raw   = get('credit')
         txn_type_raw = get('txn_type').strip()
 
-        debit = clean_amount(debit_raw) if debit_raw else None
+        debit  = clean_amount(debit_raw)  if debit_raw  else None
         credit = clean_amount(credit_raw) if credit_raw else None
 
-        # Derive txn_type from Type column or amounts
+        # Derive txn_type from explicit "Type" column; fall back to amounts.
         if txn_type_raw.lower() == 'debit':
             txn_type = 'DR'
         elif txn_type_raw.lower() == 'credit':
@@ -404,73 +477,71 @@ class IndusIndBankExtractor(BaseBankExtractor):
         else:
             txn_type = 'DR' if debit else ('CR' if credit else '')
 
-        # IndusInd date formats
         date_formats = ['%d-%b-%y', '%d-%b-%Y', '%d %b %Y', '%d/%m/%Y']
         parsed_txn_date = parse_date(date_part, date_formats)
-        value_date_raw = get('value_date')
-        parsed_val_date = parse_date(value_date_raw.split(' ')[0] if value_date_raw else '',
-                                     date_formats)
+        parsed_val_date = parse_date(
+            value_date_raw.split(' ')[0] if value_date_raw else '',
+            date_formats,
+        )
 
         balance_raw = get('balance')
-        # Balance can be negative in IndusInd
         balance = None
         if balance_raw:
-            balance = clean_amount(balance_raw.replace('−', '-').replace('–', '-'))
+            balance = clean_amount(
+                balance_raw.replace('−', '-').replace('–', '-')
+            )
 
-        # Extract posted_time from "Transaction Date & Time" (e.g. '01-APR-25 06:59:44')
+        # ── FIX 4: Extract posted_time correctly ──────────────────
+        # After stripping the apostrophe the cell is "01-APR-25 06:59:44".
+        # Split on the FIRST space → exactly 2 parts; second part is the time.
         posted_time = ''
-        if txn_date_raw and ' ' in txn_date_raw:
-            parts = txn_date_raw.split(' ', 2)
-            if len(parts) >= 3 and re.match(r'\d{1,2}:\d{2}:\d{2}', parts[2]):
-                posted_time = parts[2].strip()
+        if ' ' in txn_date_raw:
+            parts = txn_date_raw.split(' ', 1)
+            time_candidate = parts[1].strip() if len(parts) == 2 else ''
+            if re.match(r'\d{1,2}:\d{2}:\d{2}', time_candidate):
+                posted_time = time_candidate
 
-        ref = get('reference')
+        ref = get('reference').lstrip("'")
         return {
-            'sno': '',
-            'tran_id': ref,
+            'sno':              '',
+            'tran_id':          ref,
             'transaction_date': parsed_txn_date,
-            'value_date': parsed_val_date,
-            'posted_time': posted_time,
-            'narration': get('narration'),
-            'debit': debit,
-            'credit': credit,
-            'balance': balance,
-            'txn_type': txn_type,
-            'reference': ref,
+            'value_date':       parsed_val_date,
+            'posted_time':      posted_time,
+            'narration':        _clean_narration(get('narration')),
+            'debit':            debit,
+            'credit':           credit,
+            'balance':          balance,
+            'txn_type':         txn_type,
+            'reference':        ref,
         }
 
-    # ── Strategy 2: regex ────────────────────────────────────────
+    # ── Strategy 2: regex fallback ───────────────────────────────
 
     def _extract_via_regex(self, raw_text: str) -> pd.DataFrame:
-        """
-        IndusInd raw text: narrations can wrap to next line(s).
-        Example: "ACH DR INW" on line 1, "PAY/67e803f7cf11b9303ebc3a0c/AXIS BANK/" on line 2.
-        """
         rows = []
-        AMT_PAT = r'(-?[\d,]+(?:\.\d{1,2})?)'  # 14660, 141804.8, -126621063.04
-        DATE_PAT = r'(\d{2}\s+\w{3}\s+\d{4})'     # '01 Apr 2025'
+        AMT_PAT      = r'(-?[\d,]+(?:\.\d{1,2})?)' # 14660, 141804.8
+        DATE_PAT     = r'(\d{2}\s+\w{3}\s+\d{4})'  # '01 Apr 2025'
         TXN_DATE_PAT = r"'?(\d{2}-[A-Z]{3}-\d{2,4})"  # '01-APR-25
 
         line_re = re.compile(
-            r'^\s*\*?(\S+)\s+'       # Bank Reference
-            r'' + DATE_PAT + r'\s+'  # Value Date
-            r'' + TXN_DATE_PAT + r'[\s\d:]+\s+'  # Txn Date & Time
-            r'(Debit|Credit)\s+'     # Type
-            r'(.+?)\s+'              # Narration
-            r'(?:' + AMT_PAT + r'\s+)?'  # optional debit
-            r'(?:' + AMT_PAT + r'\s+)?'  # optional credit
-            r'' + AMT_PAT + r'\s*$', # balance
+            r'^\s*\*?(\S+)\s+'
+            + DATE_PAT + r'\s+'
+            + TXN_DATE_PAT + r'[\s\d:]+\s+'
+            + r'(Debit|Credit)\s+'
+            + r'(.+?)\s+'
+            + r'(?:' + AMT_PAT + r'\s+)?'
+            + r'(?:' + AMT_PAT + r'\s+)?'
+            + AMT_PAT + r'\s*$',
             re.MULTILINE | re.I
         )
 
-        # New transaction start: ref-like + date (e.g. S31201400 01 Apr 2025 or 'ICIN... 31 Mar 2025)
         txn_start_re = re.compile(
             r'^\s*[\'*]?[A-Z0-9]+\s+\d{2}\s+\w{3}\s+\d{4}\s+',
             re.MULTILINE | re.I
         )
 
         def get_continuation_narration(start: int, end: int) -> str:
-            """Extract continuation lines between two transaction matches."""
             block = raw_text[start:end]
             lines = []
             for line in block.split('\n'):
@@ -478,69 +549,83 @@ class IndusIndBankExtractor(BaseBankExtractor):
                 if not s:
                     continue
                 if re.match(r'^--\s*\d+\s+of\s+\d+\s*--', s) or re.match(r'^\d+$', s):
-                    continue  # skip page footer
+                    continue
                 if txn_start_re.match(s):
-                    break  # next transaction, stop
+                    break
                 lines.append(s)
             return ' '.join(lines) if lines else ''
 
-        matches = list(line_re.finditer(raw_text))
-        date_fmts = ['%d-%b-%y', '%d-%b-%Y', '%d %b %Y']
+        matches    = list(line_re.finditer(raw_text))
+        date_fmts  = ['%d-%b-%y', '%d-%b-%Y', '%d %b %Y']
+
         for i, m in enumerate(matches):
-            ref = m.group(1)
-            val_date = parse_date(m.group(2), ['%d %b %Y'])
-            txn_date = parse_date(m.group(3), date_fmts)
+            ref          = m.group(1)
+            val_date     = parse_date(m.group(2), ['%d %b %Y'])
+            txn_date     = parse_date(m.group(3), date_fmts)
             txn_type_raw = m.group(4).strip().lower()
-            narration = m.group(5).strip()
-            # Append continuation lines (narration wraps to next line in PDF)
+            narration    = m.group(5).strip()
+
             next_start = matches[i + 1].start() if i + 1 < len(matches) else len(raw_text)
             cont = get_continuation_narration(m.end(), next_start)
-            if cont:
-                narration = (narration + ' ' + cont).strip()
-            g6, g7, g8 = m.group(6), m.group(7), m.group(8)
+            narration = _clean_narration(narration + '\n' + cont if cont else narration)
 
+            g6, g7, g8 = m.group(6), m.group(7), m.group(8)
             txn_type = 'DR' if txn_type_raw == 'debit' else 'CR'
-            # First amount (g6) is debit or credit; g8 is balance (g7 unused for single-amount rows)
-            amt = clean_amount(g6) if g6 else None
-            g7_val = clean_amount(g7) if g7 else None
-            # UTR/reference sanity: PDF may have UTR (12-digit) before actual amount; use smaller
+
+            amt     = clean_amount(g6) if g6 else None
+            g7_val  = clean_amount(g7) if g7 else None
             if amt is not None and g7_val is not None and amt >= 1e8 and g7_val < 1e8:
                 amt = g7_val
-            debit = amt if txn_type == 'DR' else None
-            credit = amt if txn_type == 'CR' else None
+            debit   = amt if txn_type == 'DR' else None
+            credit  = amt if txn_type == 'CR' else None
             balance = clean_amount(g8)
 
-            # Extract posted_time from txn date/time string (e.g. '01-APR-25 06:59:44')
+            # FIX 4 (regex path): search for HH:MM:SS anywhere in the match
             posted_time = ''
-            txn_dt_match = re.search(r'(\d{1,2}:\d{2}:\d{2})', m.group(0))
-            if txn_dt_match:
-                posted_time = txn_dt_match.group(1)
+            t_match = re.search(r'(\d{1,2}:\d{2}:\d{2})', m.group(0))
+            if t_match:
+                posted_time = t_match.group(1)
 
             rows.append({
-                'sno': '',
-                'tran_id': ref,
+                'sno':              '',
+                'tran_id':          ref,
                 'transaction_date': txn_date,
-                'value_date': val_date,
-                'posted_time': posted_time,
-                'narration': narration,
-                'debit': debit,
-                'credit': credit,
-                'balance': balance,
-                'txn_type': txn_type,
-                'reference': ref,
+                'value_date':       val_date,
+                'posted_time':      posted_time,
+                'narration':        narration,
+                'debit':            debit,
+                'credit':           credit,
+                'balance':          balance,
+                'txn_type':         txn_type,
+                'reference':        ref,
             })
 
         df = pd.DataFrame(rows) if rows else pd.DataFrame()
         return self._finalize_df(df)
 
+    # ── _finalize_df ──────────────────────────────────────────────
+
     def _finalize_df(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return _normalize_df_with_rowid(df)
+
         for col in ('debit', 'credit', 'balance'):
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
+
         df = df.dropna(subset=['transaction_date'])
+
+        # ── FIX 10: Guard against parse_date returning string "NaT" ──
+        # convert to string and exclude anything that is not YYYY-MM-DD
         if 'transaction_date' in df.columns:
-            df = df[df['transaction_date'].astype(str).str.match(r'\d{4}-\d{2}-\d{2}', na=False)]
+            df = df[
+                df['transaction_date'].astype(str).str.match(
+                    r'\d{4}-\d{2}-\d{2}', na=False
+                )
+            ]
+
+        # FIX 6: Preserve PDF page order — do NOT sort by date.
+        df = df.reset_index(drop=True)
         df = _correct_utr_as_amount(df)
+        df = _add_balance_ok(df)
         return _normalize_df_with_rowid(df)
